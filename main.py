@@ -35,7 +35,7 @@ def extract_text(pdf_path):
     text = ""
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            page_text = page.extract_text()
+            page_text = page.extract_text(x_tolerance=2, y_tolerance=3)
             if page_text:
                 text += page_text + "\n"
     return text
@@ -63,7 +63,11 @@ def month_end(year, month):
 
 
 def parse_percent(token):
-    token = token.replace("%", "").replace("*", "").replace(",", "").strip()
+    token = str(token)
+    token = token.replace("%", "")
+    token = token.replace("*", "")
+    token = token.replace(",", "")
+    token = token.strip()
 
     if token in ["", "-", "nan", "None"]:
         return None
@@ -135,38 +139,86 @@ def is_header(line):
     return "JAN FEB MAR APR" in upper and "DEC" in upper and "YEAR" in upper
 
 
-def is_year_row(line):
-    clean = " ".join(line.strip().split())
-    return re.match(r"^20\d{2}\s+", clean) is not None
-
-
 def find_performance_tables(text):
     lines = [" ".join(line.strip().split()) for line in text.splitlines()]
     tables = []
-    current = None
 
-    for line in lines:
-        if is_header(line):
-            if current:
-                tables.append(current)
-            current = []
+    stop_words = [
+        "All returns",
+        "Performance Attribution",
+        "Current Exposure",
+        "Disclaimer",
+        "Contact",
+        "Manager Profiles",
+        "Fund Terms",
+        "Fund Term",
+    ]
+
+    for i, line in enumerate(lines):
+        if not is_header(line):
             continue
 
-        if current is None:
-            continue
+        rows = []
 
-        if is_year_row(line):
-            current.append(line)
-            continue
+        for next_line in lines[i + 1:]:
+            if is_header(next_line):
+                break
 
-        if current and len(current) >= 1:
-            if line == "":
+            if any(word.lower() in next_line.lower() for word in stop_words):
+                break
+
+            year_matches = list(re.finditer(r"\b20\d{2}\b", next_line))
+
+            if not year_matches:
                 continue
-            tables.append(current)
-            current = None
 
-    if current:
-        tables.append(current)
+            for idx, match in enumerate(year_matches):
+                start = match.start()
+                end = year_matches[idx + 1].start() if idx + 1 < len(year_matches) else len(next_line)
+
+                row_text = next_line[start:end]
+                tokens = row_text.split()
+
+                if not tokens:
+                    continue
+
+                year = tokens[0]
+
+                if not re.match(r"^20\d{2}$", year):
+                    continue
+
+                nums = []
+
+                for token in tokens[1:]:
+                    value = parse_percent(token)
+                    if value is not None:
+                        nums.append(token)
+
+                if len(nums) >= 2:
+                    rows.append(" ".join([year] + nums))
+
+        if rows:
+            unique_rows = []
+            seen = set()
+
+            for row in rows:
+                tokens = row.split()
+                if not tokens:
+                    continue
+
+                year = tokens[0]
+                nums = tokens[1:]
+
+                if len(nums) > 13:
+                    nums = nums[:13]
+
+                cleaned_row = " ".join([year] + nums)
+
+                if cleaned_row not in seen:
+                    unique_rows.append(cleaned_row)
+                    seen.add(cleaned_row)
+
+            tables.append(unique_rows)
 
     return tables
 
@@ -188,7 +240,9 @@ def choose_primary_table(tables, fund_name):
 
 def infer_months(year, values, updated):
     if len(values) >= 13:
-        return values[:12], list(range(1, 13)), values[12]
+        monthly_values = values[:12]
+        reported = values[12]
+        return monthly_values, list(range(1, 13)), reported
 
     reported = values[-1]
     monthly_values = values[:-1]
@@ -215,6 +269,13 @@ def parse_table_rows(rows, static_id, aum, updated, source_file):
 
     for row in rows:
         tokens = row.split()
+
+        if not tokens:
+            continue
+
+        if not re.match(r"^20\d{2}$", tokens[0]):
+            continue
+
         year = int(tokens[0])
 
         values = []
@@ -320,7 +381,8 @@ def main():
         return
 
     df = df.sort_values(["id", "date", "source_file"])
-
+    df = df.drop_duplicates(subset=["id", "date"], keep="first")
+    df = df.sort_values(["id", "date", "source_file"])
     boss_output = df[["id", "date", "ror", "aum", "updated"]].copy()
     boss_output.to_csv(OUTPUT_FILE, index=False)
 
